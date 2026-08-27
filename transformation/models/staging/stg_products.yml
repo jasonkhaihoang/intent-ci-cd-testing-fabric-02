@@ -1,0 +1,20 @@
+version: 2
+
+models:
+  - name: stg_products
+    description: >
+      One row per product. Staging layer, 1:1 with the committed products seed.
+    columns:
+      - name: product_id
+        description: Unique product identifier.
+        tests:
+          - not_null
+          - unique
+      - name: product_name
+        description: Human-readable product name.
+      - name: category
+        description: Product category.
+      - name: unit_cost
+        description: Cost per unit.
+      - name: is_active
+        description: Whether the product is currently active.

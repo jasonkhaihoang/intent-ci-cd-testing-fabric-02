@@ -1,0 +1,6 @@
+product_id,product_name,category,unit_cost,is_active
+1,Widget,Widgets,10.50,true
+2,Gadget,Gadgets,20.00,true
+3,Gizmo,Gadgets,15.75,false
+4,Doodad,Widgets,5.25,true
+5,Thingamajig,Misc,42.00,true
