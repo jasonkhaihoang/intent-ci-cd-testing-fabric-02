@@ -51,7 +51,6 @@ jobs:
       llm_api_key_var: ${{ steps.preflight.outputs.LLM_API_KEY_VAR }}
       llm_api_url_var: ${{ steps.preflight.outputs.LLM_API_URL_VAR }}
       llm_model_var: ${{ steps.preflight.outputs.LLM_MODEL_VAR }}
-      entra_id_domain_var: ${{ steps.preflight.outputs.ENTRA_ID_DOMAIN_VAR }}
     steps:
       - if: vars.FAKE_WORLD == ''
         uses: actions/checkout@v5
@@ -135,6 +134,23 @@ jobs:
           echo "ephemeral_name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "Ephemeral workspace name: ${NAME}"
 
+      # Capacity grant (AC-105): creating the ephemeral workspace needs permission over
+      # the capacity, separate from any workspace role. Checked here so a missing grant
+      # fails preflight by name instead of provision with a 403 that reads like an outage.
+      - name: Login — CI identity
+        if: vars.FAKE_WORLD == ''
+        uses: azure/login@v3
+        with:
+          tenant-id: ${{ vars[steps.preflight.outputs.AZURE_TENANT_ID_VAR] }}
+          client-id: ${{ vars[steps.preflight.outputs.AZURE_CLIENT_ID_VAR] }}
+          allow-no-subscriptions: true
+
+      - name: Check Fabric capacity access
+        if: vars.FAKE_WORLD == '' || vars.FAKE_WORLD_FABRIC_CAPACITY != ''
+        env:
+          FABRIC_CAPACITY_ID: ${{ vars[steps.preflight.outputs.FABRIC_CAPACITY_ID_VAR] }}
+        run: python3 ${{ env.SCRIPTS }}/fabric_capacity_check.py --report reports/preflight.json
+
       - name: Post preflight comment
         if: always()
         env:
@@ -196,6 +212,28 @@ jobs:
               "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
           )
           EOF
+
+  # ─── MANAGED REQUIREMENTS ─────────────────────────────────────────────────
+  # Standalone check (VD-6569, ADR 0023): fails the PR if ingestion/requirements.txt or a vendored
+  # connector's ingestion/sources/<connector>/requirements.txt gives a version to a package the
+  # delivered .github/managed-constraints.txt names. No `needs:` and no status context of its own.
+  managed-requirements:
+    name: Managed requirements
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - if: vars.FAKE_WORLD == ''
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.head_ref }}
+
+      - if: vars.FAKE_WORLD == ''
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Check ingestion requirements against the managed constraints
+        run: python3 .github/scripts/managed_requirements_gate.py
 
   # ─── ADR NUMBERING ────────────────────────────────────────────────────────
   # Standalone check: fails the PR if docs/adr/ has duplicate leading numbers, or
@@ -314,7 +352,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       # No dbt shim for this job — real dbt required on PATH (VD-3341). Keep unconditional.
-      - run: pip install pyyaml "dbt-core>=1.8" "dbt-fabricspark>=1.8" --quiet
+      - run: pip install -c .github/managed-constraints.txt pyyaml dbt-core dbt-fabricspark --quiet
 
       - name: Emit Gate 1 pending
         env:
@@ -352,7 +390,7 @@ jobs:
           print(f"prod_manifest_source.mode={mode}")
           EOF
 
-      - name: Login — per-domain SPN (onelake mode only)
+      - name: Login — CI identity (onelake mode only)
         if: steps.parse-mode.outputs.mode == 'onelake' && vars.FAKE_WORLD == ''
         uses: azure/login@v3
         with:
@@ -456,7 +494,7 @@ jobs:
         if: always() && steps.fetch.outputs.greenfield_fallback != 'true' && hashFiles('prod-state/manifest.json') != ''
         run: |
           dbt deps --project-dir "$PROJ" --profiles-dir .github/profiles --target dbt_fabric_compile 2>&1 | tail -3 || true
-          modified=$(dbt ls --select state:modified+ --state prod-state \
+          modified=$(dbt ls --select state:modified+ --state "$(pwd)/prod-state" \
                        --project-dir "$PROJ" \
                        --profiles-dir .github/profiles --target dbt_fabric_compile \
                        --output name 2>/dev/null | grep -v '^\(Running\|Found\|Update\)' || true)
@@ -584,11 +622,11 @@ jobs:
           EOF
 
   # ─── DESIGN DRIFT ────────────────────────────────────────────────────────────
-  # Runner-side LLM gate: compares intent/<intent-id>/design.md against state:modified.
+  # Runner-side LLM gate: compares changed design records against state:modified.
   # Hard DAG gate: provision-workspace needs this job so a drift failure short-circuits
   # the ephemeral workspace + Spark provision before any compute is spent (AC-8).
   design-drift:
-    name: "ci/design-drift: design.md vs state:modified"
+    name: "ci/design-drift: design records vs state:modified"
     needs: [preflight, fetch-prod-state]
     if: github.event.action != 'closed'
     runs-on: ubuntu-latest
@@ -600,6 +638,8 @@ jobs:
     steps:
       - if: vars.FAKE_WORLD == ''
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Resolve layout
         run: |
@@ -612,7 +652,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       # No dbt shim for this job — real dbt required on PATH (VD-3341). Keep unconditional.
-      - run: pip install pyyaml "dbt-core>=1.8" "dbt-fabricspark>=1.8" --quiet
+      - run: pip install -c .github/managed-constraints.txt pyyaml dbt-core dbt-fabricspark --quiet
 
       - name: Emit ci/design-drift pending
         env:
@@ -655,9 +695,27 @@ jobs:
           EOF
 
       - name: Parse dbt project
+        id: parse
+        # VD-5918: the parse output is kept so a parse failure can be relayed
+        # on this gate's own status. An artifact that stops the project parsing
+        # is exactly what these gates exist to judge, and it was the one case
+        # where they reported nothing but "see job logs".
         run: |
-          dbt deps --project-dir "$PROJ" --profiles-dir .github/profiles --target dbt_fabric_compile --quiet
-          dbt parse --project-dir "$PROJ" --profiles-dir .github/profiles --target dbt_fabric_compile --quiet
+          set -o pipefail
+          dbt deps --project-dir "$PROJ" --profiles-dir .github/profiles --target dbt_fabric_compile --quiet 2>&1 | tee -a gate-parse.log
+          dbt parse --project-dir "$PROJ" --profiles-dir .github/profiles --target dbt_fabric_compile --quiet 2>&1 | tee -a gate-parse.log
+
+      - name: Resolve changed paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          FAKE_WORLD: ${{ vars.FAKE_WORLD }}
+        run: |
+          # Fake-world deploys a one-commit repo with no PR base: every file counts as changed.
+          if [ -n "$FAKE_WORLD" ]; then
+            find . -type f -not -path './.git/*' | sed 's|^\./||' > changed-paths.txt
+          else
+            git diff --name-only --diff-filter=d "$BASE_SHA"...HEAD > changed-paths.txt
+          fi
 
       - name: Run design-drift gate
         id: run-gate
@@ -673,7 +731,7 @@ jobs:
           python3 ${{ env.SCRIPTS }}/design_drift_runner.py \
             --pr-number  "${{ github.event.pull_request.number }}" \
             --head-sha   "${{ github.event.pull_request.head.sha }}" \
-            --intent-id  "${{ needs.preflight.outputs.intent_slug }}" \
+            --changed-paths changed-paths.txt \
             --manifest   "$PROJ/target/manifest.json" \
             --modified   "reports/modified.json"
 
@@ -683,214 +741,45 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PARSE_OUTCOME: ${{ steps.parse.outcome }}
         run: |
           python3 - <<'EOF'
           import os, sys
           sys.path.insert(0, ".github/scripts")
           import emit_status
+          from dbt_error_report import summarize_parse_failure
+          # Only the parse step's own failure puts a rejection in that log. This
+          # emitter fires on any pre-runner failure, and a log from a parse that
+          # succeeded would otherwise be relayed as the cause of something else.
+          cause = ""
+          if os.environ.get("PARSE_OUTCOME") == "failure":
+              try:
+                  with open("gate-parse.log") as f:
+                      cause = summarize_parse_failure(f.read())
+              except OSError:
+                  cause = ""
           emit_status.emit_status(
               os.environ["GITHUB_REPOSITORY"],
               os.environ["CI_HEAD_SHA"],
               "ci/design-drift",
               "failure",
-              "Gate failed before runner started: see job logs",
+              cause or "Gate failed before runner started: see job logs",
               "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
           )
           EOF
 
   # ─── PROVISION ────────────────────────────────────────────────────────────
   # 1. KV UAMI: fetch Fabric capacity ID + GitHub App config → GITHUB_ENV
-  # 2. Fabric UAMI: find-or-create workspace + lakehouse, inject notebook
-  # ─── ORCHESTRATION ──────────────────────────────────────────────────────────
-  # Validates the optional `## Schedule` design-contract section in intent/<slug>/design.md.
-  # Platform-neutral: cron/DAG/selector resolution only — does not deploy schedules.
-  orchestration:
-    name: "ci/orchestration: schedule design contract"
-    if: github.event.action != 'closed'
-    needs: [preflight, design-drift]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      statuses: write
-      pull-requests: write
-    steps:
-      - if: vars.FAKE_WORLD == ''
-        uses: actions/checkout@v5
-
-      - name: Resolve layout
-        run: |
-          echo "PROJ=$([ -f transformation/dbt_project.yml ] && echo transformation || echo .)" >> "$GITHUB_ENV"
-          echo "CICFG=.workflow/ci-config.yml" >> "$GITHUB_ENV"
-
-      - if: vars.FAKE_WORLD == ''
-        uses: actions/setup-python@v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      # No dbt shim for this job — real dbt required on PATH (VD-3341). Keep unconditional.
-      - run: pip install pyyaml "dbt-core>=1.8" "dbt-fabricspark>=1.8" --quiet
-
-      - name: Emit ci/orchestration pending
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          python3 - <<'EOF'
-          import os, sys
-          sys.path.insert(0, ".github/scripts")
-          import emit_status
-          emit_status.emit_status(
-              os.environ["GITHUB_REPOSITORY"],
-              os.environ["CI_HEAD_SHA"],
-              "ci/orchestration",
-              "pending",
-              "Gate: orchestration running",
-              "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-          )
-          EOF
-
-      - name: Parse dbt project
-        run: |
-          dbt deps --project-dir "$PROJ" --profiles-dir .github/profiles --target dbt_fabric_compile --quiet
-          dbt parse --project-dir "$PROJ" --profiles-dir .github/profiles --target dbt_fabric_compile --quiet
-
-      - name: Run orchestration gate
-        id: run-gate
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_SERVER_URL: ${{ github.server_url }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: |
-          python3 ${{ env.SCRIPTS }}/orchestration_gate_runner.py \
-            --pr-number  "${{ github.event.pull_request.number }}" \
-            --head-sha   "${{ github.event.pull_request.head.sha }}" \
-            --intent-id  "${{ needs.preflight.outputs.intent_slug }}" \
-            --manifest   "$PROJ/target/manifest.json"
-
-      - name: Emit ci/orchestration final-status failure
-        if: failure() && steps.run-gate.conclusion != 'failure'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          python3 - <<'EOF'
-          import os, sys
-          sys.path.insert(0, ".github/scripts")
-          import emit_status
-          emit_status.emit_status(
-              os.environ["GITHUB_REPOSITORY"],
-              os.environ["CI_HEAD_SHA"],
-              "ci/orchestration",
-              "failure",
-              "Gate failed before runner started: see job logs",
-              "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-          )
-          EOF
-
-  # ─── SEMANTIC-MODEL ─────────────────────────────────────────────────────────
-  # Validates the optional `## Semantic Model` design-contract section against the dbt
-  # MetricFlow objects in manifest.json. Static only — no live MetricFlow query runtime check.
-  semantic-model:
-    name: "ci/semantic-model: dbt MetricFlow design contract"
-    if: github.event.action != 'closed'
-    needs: [preflight, design-drift]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      statuses: write
-      pull-requests: write
-    steps:
-      - if: vars.FAKE_WORLD == ''
-        uses: actions/checkout@v5
-
-      - name: Resolve layout
-        run: |
-          echo "PROJ=$([ -f transformation/dbt_project.yml ] && echo transformation || echo .)" >> "$GITHUB_ENV"
-          echo "CICFG=.workflow/ci-config.yml" >> "$GITHUB_ENV"
-
-      - if: vars.FAKE_WORLD == ''
-        uses: actions/setup-python@v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      # No dbt shim for this job — real dbt required on PATH (VD-3341). Keep unconditional.
-      - run: pip install pyyaml "dbt-core>=1.8" "dbt-fabricspark>=1.8" --quiet
-
-      - name: Emit ci/semantic-model pending
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          python3 - <<'EOF'
-          import os, sys
-          sys.path.insert(0, ".github/scripts")
-          import emit_status
-          emit_status.emit_status(
-              os.environ["GITHUB_REPOSITORY"],
-              os.environ["CI_HEAD_SHA"],
-              "ci/semantic-model",
-              "pending",
-              "Gate: semantic-model running",
-              "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-          )
-          EOF
-
-      - name: Parse dbt project
-        run: |
-          dbt deps --project-dir "$PROJ" --profiles-dir .github/profiles --target dbt_fabric_compile --quiet
-          dbt parse --project-dir "$PROJ" --profiles-dir .github/profiles --target dbt_fabric_compile --quiet
-
-      - name: Run semantic-model gate
-        id: run-gate
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_SERVER_URL: ${{ github.server_url }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: |
-          python3 ${{ env.SCRIPTS }}/semantic_model_gate_runner.py \
-            --pr-number  "${{ github.event.pull_request.number }}" \
-            --head-sha   "${{ github.event.pull_request.head.sha }}" \
-            --intent-id  "${{ needs.preflight.outputs.intent_slug }}" \
-            --manifest   "$PROJ/target/manifest.json"
-
-      - name: Emit ci/semantic-model final-status failure
-        if: failure() && steps.run-gate.conclusion != 'failure'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          python3 - <<'EOF'
-          import os, sys
-          sys.path.insert(0, ".github/scripts")
-          import emit_status
-          emit_status.emit_status(
-              os.environ["GITHUB_REPOSITORY"],
-              os.environ["CI_HEAD_SHA"],
-              "ci/semantic-model",
-              "failure",
-              "Gate failed before runner started: see job logs",
-              "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-          )
-          EOF
-
+  # 2. Fabric UAMI: find-or-create workspace + lakehouse
   provision-workspace:
-    name: "Provision workspace, environment, shortcuts, notebook"
+    name: "Provision workspace, environment, shortcuts"
     if: github.event.action != 'closed'
-    needs: [preflight, fetch-prod-state, design-drift, orchestration, semantic-model]
+    needs: [preflight, fetch-prod-state, design-drift]
     runs-on: ubuntu-latest
     outputs:
       ephemeral_workspace_id: ${{ steps.provision.outputs.workspace_id }}
       ephemeral_lakehouse_id: ${{ steps.provision.outputs.lakehouse_id }}
       lakehouse_name: ${{ steps.provision.outputs.lakehouse_name }}
-      interactive_notebook_id: ${{ steps.generate-notebook.outputs.interactive_notebook_id }}
     steps:
       - if: vars.FAKE_WORLD == ''
         uses: actions/checkout@v5
@@ -907,7 +796,7 @@ jobs:
 
       - run: pip install pyyaml --quiet
 
-      - name: Login — per-domain SPN
+      - name: Login — CI identity
         if: vars.FAKE_WORLD == ''
         uses: azure/login@v3
         with:
@@ -930,7 +819,7 @@ jobs:
               os.environ["CI_HEAD_SHA"],
               "ci/provision",
               "pending",
-              "Provision workspace, environment, shortcuts, notebook",
+              "Provision workspace, environment, shortcuts",
               "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
           )
           EOF
@@ -970,18 +859,6 @@ jobs:
             --environment-name "${{ steps.create-environment.outputs.environment_name }}" \
             --runtime-version "${{ steps.create-environment.outputs.runtime_version }}"
 
-      - name: Add PR author as Admin on ephemeral workspace
-        env:
-          ENTRA_ID_DOMAIN: ${{ vars[needs.preflight.outputs.entra_id_domain_var] }}
-          ENTRA_ID_UPN_OVERRIDE: ${{ secrets.ENTRA_ID_UPN_OVERRIDE }}
-        run: |
-          python3 ${{ env.SCRIPTS }}/fabric_api.py add-contributor \
-            --workspace-id "${{ steps.provision.outputs.workspace_id }}" \
-            --github-login "${{ github.event.pull_request.user.login }}" \
-            --pr-number "${{ github.event.pull_request.number }}" \
-            --repo "${{ github.repository }}" \
-            --role Admin
-
       - name: Download prod-state artifact
         uses: actions/download-artifact@v8
         with:
@@ -1016,7 +893,7 @@ jobs:
 
       - name: Install dbt and parse current branch
         run: |
-          pip install "dbt-core>=1.8" "dbt-fabricspark>=1.8" --quiet
+          pip install -c .github/managed-constraints.txt dbt-core dbt-fabricspark --quiet
           dbt deps --project-dir "$PROJ" --quiet
           dbt parse --project-dir "$PROJ" --profiles-dir .github/profiles --target dbt_fabric_compile --quiet
 
@@ -1078,26 +955,11 @@ jobs:
             --local-path /tmp/project.zip \
             --remote-path "Files/ci-artifacts/dbt-project/${{ github.event.pull_request.head.sha }}/project.zip"
 
-      - name: Deploy interactive notebook
-        id: generate-notebook
-        env:
-          EPHEMERAL_WORKSPACE_ID: ${{ steps.provision.outputs.workspace_id }}
-          EPHEMERAL_WORKSPACE_NAME: ${{ needs.preflight.outputs.ephemeral_name }}
-          EPHEMERAL_LAKEHOUSE_ID: ${{ steps.provision.outputs.lakehouse_id }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PROJECT_ZIP_ABFSS: ${{ steps.upload-dbt-project.outputs.abfss_path }}
-          PROD_STATE_ABFSS: ${{ steps.upload-prod-state.outputs.abfss_path }}
-          CI_TARGET: ${{ needs.preflight.outputs.ci_target }}
-          PROD_WORKSPACE_NAME: ${{ needs.preflight.outputs.prod_workspace_name }}
-          PROD_LAKEHOUSE_NAME: ${{ needs.preflight.outputs.prod_lakehouse_name }}
-        run: python3 ${{ env.SCRIPTS }}/generate_ci_notebook.py
-
       - name: Post workspace comment
         if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EPHEMERAL_WORKSPACE_ID: ${{ steps.provision.outputs.workspace_id }}
           EPHEMERAL_WORKSPACE_NAME: ${{ needs.preflight.outputs.ephemeral_name }}
           HEAD_BRANCH: ${{ github.head_ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -1111,8 +973,6 @@ jobs:
           STEP_UPLOAD_PROD_STATE: ${{ steps.upload-prod-state.outcome }}
           STEP_DERIVE_SHORTCUTS: ${{ steps.derive-shortcuts.outcome }}
           STEP_SEED_SHORTCUTS: ${{ steps.seed-shortcuts.outcome }}
-          STEP_GENERATE_NOTEBOOK: ${{ steps.generate-notebook.outcome }}
-          INTERACTIVE_NOTEBOOK_ID: ${{ steps.generate-notebook.outputs.interactive_notebook_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 ${{ env.SCRIPTS }}/notify.py --workspace-comment-only
 
@@ -1166,7 +1026,7 @@ jobs:
 
       - name: Install analysis tools
         run: |
-          pip install ruff sqlfluff pyyaml "dbt-core>=1.8" "dbt-fabricspark>=1.8" --quiet
+          pip install -c .github/managed-constraints.txt ruff sqlfluff sqlfluff-templater-dbt pyyaml dbt-core dbt-fabricspark --quiet
           case "$(uname -m)" in
             arm64|aarch64) GITLEAKS_ARCH=linux_arm64 ;;
             *)              GITLEAKS_ARCH=linux_x64 ;;
@@ -1198,11 +1058,57 @@ jobs:
 
       - name: ruff
         continue-on-error: true
-        run: ruff check . --extend-exclude .github --output-format json > reports/ruff.json 2>/dev/null
+        run: ruff check . --extend-exclude .github,ingestion/sources --output-format json > reports/ruff.json 2>/dev/null
+
+      - name: Prepare dbt-aware SQL linting
+        continue-on-error: true
+        env:
+          SQLFLUFF_DBT_PROFILE: dbt_fab_spark
+          SQLFLUFF_DBT_TARGET: dbt_fabric_compile
+        run: |
+          dbt deps --project-dir "$PROJ" --quiet 2>/dev/null || true
+          python3 - <<'PYEOF'
+          import configparser
+          import os
+
+          proj = os.environ["PROJ"]
+          # sqlfluff's dbt templater loads the dbt project once, in
+          # sequence_files(), from the lint's ROOT config (./.sqlfluff) only;
+          # a nearer $PROJ/.sqlfluff is applied per file, after that. So the
+          # root file must carry these keys. An existing $PROJ/.sqlfluff gets
+          # them too, so it can't override the root templater (VD-6511).
+          sqlfluff_paths = [".sqlfluff"]
+          proj_sqlfluff = os.path.join(proj, ".sqlfluff")
+          if proj != "." and os.path.exists(proj_sqlfluff):
+              sqlfluff_paths.append(proj_sqlfluff)
+          for sqlfluff_path in sqlfluff_paths:
+              config = configparser.RawConfigParser()
+              config.read(sqlfluff_path)  # no-op if the file doesn't exist — never clobbers an
+                                           # existing domain-repo .sqlfluff's other settings.
+              existing_sqlfluff = dict(config["sqlfluff"]) if config.has_section("sqlfluff") else {}
+              config["sqlfluff"] = {**existing_sqlfluff, "templater": "dbt"}
+              # Preserve any other dbt-templater key the domain repo set (e.g.
+              # dbt_skip_compilation, templater context vars) — override only the
+              # four coordinates Gate 0 owns.
+              existing_dbt = (
+                  dict(config["sqlfluff:templater:dbt"])
+                  if config.has_section("sqlfluff:templater:dbt")
+                  else {}
+              )
+              config["sqlfluff:templater:dbt"] = {
+                  **existing_dbt,
+                  "profiles_dir": ".github/profiles",
+                  "profile": os.environ["SQLFLUFF_DBT_PROFILE"],
+                  "target": os.environ["SQLFLUFF_DBT_TARGET"],
+                  "project_dir": proj,
+              }
+              with open(sqlfluff_path, "w") as f:
+                  config.write(f)
+          PYEOF
 
       - name: sqlfluff
         continue-on-error: true
-        run: sqlfluff lint "$PROJ/models" --dialect sparksql --format json > reports/sqlfluff.json 2>/dev/null
+        run: sqlfluff lint "$PROJ/models" --dialect sparksql --format json > reports/sqlfluff.json 2> reports/sqlfluff.stderr || { rc=$?; cat reports/sqlfluff.stderr >&2; exit $rc; }
 
       - name: gitleaks
         continue-on-error: true
@@ -1226,7 +1132,6 @@ jobs:
           SCHEMA: dummy
           DBT_JOB_NAME: ci-parse
         run: |
-          dbt deps --project-dir "$PROJ" --quiet 2>/dev/null || true
           dbt compile --project-dir "$PROJ" --profiles-dir .github/profiles --target dbt_fabric_compile --exclude package:elementary package:dbt_project_evaluator --quiet 2>/dev/null || true
           python3 ${{ env.SCRIPTS }}/scorecard.py \
             --manifest "$PROJ/target/manifest.json" \
@@ -1288,18 +1193,27 @@ jobs:
               except (OSError, json.JSONDecodeError):
                   return None
 
+          def read_text(path):
+              try:
+                  with open(path) as f:
+                      return f.read()
+              except OSError:
+                  return None
+
           compile_result    = load("reports/dbt_compile.json")
           schema_gate       = load("reports/schema_gate.json")
           ruff              = load("reports/ruff.json")
           sqlfluff          = load("reports/sqlfluff.json")
           gitleaks          = load("reports/gitleaks.json")
           scorecard         = load("reports/scorecard.json")
+          sqlfluff_stderr   = read_text("reports/sqlfluff.stderr")
           shortcut_seeding  = load("reports/shortcut_seeding.json")
 
           body = render_gate_0_comment(
               compile_result, schema_gate,
               ruff=ruff, sqlfluff=sqlfluff, gitleaks=gitleaks,
               scorecard=scorecard, shortcut_seeding=shortcut_seeding,
+              sqlfluff_stderr=sqlfluff_stderr,
               run_url=os.environ.get("RUN_URL", ""),
           )
           pr_comment.upsert(
@@ -1427,7 +1341,7 @@ jobs:
 
       - name: Install dbt-fabricspark
         if: vars.FAKE_WORLD == ''
-        run: pip install "dbt-core>=1.8" "dbt-fabricspark>=1.8" --quiet
+        run: pip install -c .github/managed-constraints.txt dbt-core dbt-fabricspark --quiet
 
       - name: Add fake-world dbt shim to PATH
         if: vars.FAKE_WORLD != ''
@@ -1439,7 +1353,7 @@ jobs:
         run: |
           echo "PROJ=$([ -f transformation/dbt_project.yml ] && echo transformation || echo .)" >> "$GITHUB_ENV"
 
-      - name: Login — per-domain SPN
+      - name: Login — CI identity
         if: vars.FAKE_WORLD == ''
         uses: azure/login@v3
         with:
@@ -1551,7 +1465,7 @@ jobs:
 
       - name: Install dbt-fabricspark
         if: vars.FAKE_WORLD == ''
-        run: pip install "dbt-core>=1.8" "dbt-fabricspark>=1.8" --quiet
+        run: pip install -c .github/managed-constraints.txt dbt-core dbt-fabricspark --quiet
 
       - name: Add fake-world dbt shim to PATH
         if: vars.FAKE_WORLD != ''
@@ -1563,7 +1477,7 @@ jobs:
         run: |
           echo "PROJ=$([ -f transformation/dbt_project.yml ] && echo transformation || echo .)" >> "$GITHUB_ENV"
 
-      - name: Login — per-domain SPN
+      - name: Login — CI identity
         if: vars.FAKE_WORLD == ''
         uses: azure/login@v3
         with:
@@ -1650,7 +1564,7 @@ jobs:
 
       - name: Install dbt-fabricspark
         if: vars.FAKE_WORLD == ''
-        run: pip install "dbt-core>=1.8" "dbt-fabricspark>=1.8" --quiet
+        run: pip install -c .github/managed-constraints.txt dbt-core dbt-fabricspark --quiet
 
       - name: Add fake-world dbt shim to PATH
         if: vars.FAKE_WORLD != ''
@@ -1662,7 +1576,7 @@ jobs:
         run: |
           echo "PROJ=$([ -f transformation/dbt_project.yml ] && echo transformation || echo .)" >> "$GITHUB_ENV"
 
-      - name: Login — per-domain SPN
+      - name: Login — CI identity
         if: vars.FAKE_WORLD == ''
         uses: azure/login@v3
         with:
@@ -1756,4 +1670,39 @@ jobs:
               real_work_result=os.environ["REAL_WORK_RESULT"],
           )
           EOF
-# kick: re-save to activate Actions dispatch after mirror clone
+
+  # ─── STATUS SWEEP ─────────────────────────────────────────────────────────────
+  # VD-5918: a job that never runs posts no commit status, so its required
+  # context stays pending for ever — branch protection blocks the merge and the
+  # PR never states why. This job runs on every outcome and posts a terminal
+  # failure for each required gate that did not conclude, naming the gates that
+  # actually failed. It never rewrites a status a gate posted for itself.
+  status-sweep:
+    name: "Sweep unrun required gates"
+    if: always() && github.event.action != 'closed'
+    needs: [preflight, adr-numbering, static-analysis, fetch-prod-state, design-drift, provision-workspace, gate-2-write, gate-3-unit, gate-4-data-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - if: vars.FAKE_WORLD == ''
+        uses: actions/checkout@v5
+
+      - if: vars.FAKE_WORLD == ''
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Sweep unrun required gates
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 ${{ env.SCRIPTS }}/gate_sweep_runner.py \
+            --platform fabric_lakehouse \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --needs "$NEEDS_JSON"
