@@ -1,3 +1,4 @@
+-- ci-test marker: drift-fail 2026-10-13
 -- ci-test marker
 -- Model: stg_sales_data
 -- Grain: one row per sale transaction.
